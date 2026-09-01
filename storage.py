@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from pathlib import PurePosixPath
 
@@ -150,7 +151,72 @@ class MemeStorage:
 
     def _get_bytes(self, key: str) -> bytes:
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return obj["Body"].read()
+        try:
+            return obj["Body"].read()
+        finally:
+            obj["Body"].close()
+
+    def _download_to_file(self, key: str, fileobj) -> None:
+        """
+        S3 StreamingBody -> file object。
+        不把整張圖片讀進 Python bytes；只用 64 KiB chunk 串流。
+        """
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        body = obj["Body"]
+
+        try:
+            fileobj.seek(0)
+            fileobj.truncate(0)
+
+            shutil.copyfileobj(
+                body,
+                fileobj,
+                length=64 * 1024,
+            )
+
+            fileobj.flush()
+            fileobj.seek(0)
+        finally:
+            body.close()
+
+    def download_meme_to_file(self, filename: str, fileobj) -> None:
+        self._download_to_file(
+            self._join(self.meme_prefix, filename),
+            fileobj,
+        )
+
+    def download_yn_to_file(self, filename: str, fileobj) -> None:
+        self._download_to_file(
+            self._join(self.meme_prefix, f"YN/{filename}"),
+            fileobj,
+        )
+
+    def download_airou_to_file(self, filename: str, fileobj) -> None:
+        candidates = [self.airou_prefix]
+
+        if self.airou_prefix != "Airou":
+            candidates.append("Airou")
+
+        last_error = None
+
+        for prefix in candidates:
+            try:
+                self._download_to_file(
+                    self._join(prefix, filename),
+                    fileobj,
+                )
+                return
+            except ClientError as e:
+                last_error = e
+                code = e.response.get("Error", {}).get("Code", "")
+
+                if code not in ("NoSuchKey", "404"):
+                    raise
+
+        if last_error:
+            raise last_error
+
+        raise FileNotFoundError(filename)
 
     def get_meme(self, filename: str) -> bytes:
         return self._get_bytes(self._join(self.meme_prefix, filename))
