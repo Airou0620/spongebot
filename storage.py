@@ -295,3 +295,19 @@ class MemeStorage:
             )
 
         return key
+
+    def save_received_file(self, filename: str, path) -> str:
+        key = self._join(
+            self.received_prefix,
+            filename,
+        )
+    
+        with open(path, "rb") as file:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=file,
+                ContentType="image/jpeg",
+            )
+    
+        return key
