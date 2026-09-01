@@ -1,4 +1,6 @@
 import asyncio
+import ctypes
+import gc
 import io
 import logging
 import os
@@ -55,6 +57,36 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("discord.client").setLevel(logging.ERROR)
 logging.getLogger("discord.gateway").setLevel(logging.ERROR)
+
+
+# ============================================================
+# Memory release
+# ============================================================
+# Python / Pillow 釋放物件後，glibc 不一定會立即把 heap 還給 Linux。
+# Railway Metrics 看的是 process RSS，所以圖片處理完後：
+#   1. gc.collect() 回收 Python 物件
+#   2. malloc_trim(0) 嘗試把可釋放 heap pages 還給 OS
+#
+# 只在圖片處理完成後呼叫，不改 Bot 邏輯，也不在每個純文字查詢呼叫。
+try:
+    _libc = (
+        ctypes.CDLL("libc.so.6")
+        if sys.platform.startswith("linux")
+        else None
+    )
+except OSError:
+    _libc = None
+
+
+def release_memory():
+    gc.collect()
+
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            # 記憶體釋放失敗不能影響 Bot 主功能
+            pass
 
 
 async def append_tg_log(message, level="info"):
@@ -284,6 +316,10 @@ async def dc_random(interaction: discord.Interaction):
         ),
     )
 
+    # 圖片已送出，釋放下載原圖與壓縮圖 bytes。
+    del original, compressed
+    release_memory()
+
 
 @discord_bot.tree.command(name="can_i", description="我可不可以..?")
 async def dc_can_i(interaction: discord.Interaction):
@@ -326,6 +362,9 @@ async def dc_can_i(interaction: discord.Interaction):
             filename="compressed_yn.jpg",
         ),
     )
+
+    del original, compressed
+    release_memory()
 
 
 # 原 Discord 程式中這兩個函數「沒有 @bot.tree.command decorator」。
@@ -388,6 +427,9 @@ async def dc_search(interaction: discord.Interaction, keyword: str):
                     filename="compressed.jpg",
                 )
             )
+
+            del original, compressed
+            release_memory()
 
         else:
             response = ""
@@ -622,6 +664,10 @@ async def tg_reply_to_photo(
         + f"{storage.airou_prefix}/{random_file}"
     )
 
+    # 收到的照片已存 Bucket，交換圖片也已送出。
+    del photo, received_data, original, compressed
+    release_memory()
+
 
 async def tg_random_image(
     update: Update,
@@ -657,6 +703,9 @@ async def tg_random_image(
         + "使用了抽，回覆了"
         + random_file
     )
+
+    del original, compressed
+    release_memory()
 
 
 async def tg_can_i(
@@ -703,6 +752,9 @@ async def tg_can_i(
         + "使用了可以不可以，回覆了"
         + file_name
     )
+
+    del original, compressed
+    release_memory()
 
 
 async def tg_airou(
@@ -828,6 +880,9 @@ async def tg_search_files(
                 await append_tg_log(
                     "回覆糊糊的圖"
                 )
+
+            del original, compressed
+            release_memory()
 
         else:
             response = ""
