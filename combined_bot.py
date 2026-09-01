@@ -25,6 +25,7 @@ from telegram.ext import (
 from storage import MemeStorage
 
 import sys
+import tempfile
 
 # ============================================================
 # 0. 必要的 Railway 改動
@@ -200,20 +201,24 @@ async def dc_random(interaction: discord.Interaction):
     files = await asyncio.to_thread(storage.list_memes)
     random_file = random.choice(files)
 
-    original = await asyncio.to_thread(
-        storage.get_meme,
-        random_file,
-    )
-
     await append_dc_log(
         f"{get_clean_time()} "
         f"{interaction.user.display_name} 使用了抽，回覆了 {random_file}"
     )
 
-    await interaction.followup.send(
-        f"**{interaction.user.display_name}** 使用隨機抽圖抽到了__{random_file}__",
-        file=dc_photo_file(original, random_file),
-    )
+    with tempfile.TemporaryFile() as photo_file:
+        await asyncio.to_thread(
+            storage.download_meme_to_file,
+            random_file,
+            photo_file,
+        )
+
+        await interaction.followup.send(
+            f"**{interaction.user.display_name}** 使用隨機抽圖抽到了__{random_file}__",
+            file=File(photo_file, filename=random_file),
+        )
+
+    release_memory()
 
 
 @discord_bot.tree.command(name="can_i", description="我可不可以..?")
@@ -235,20 +240,24 @@ async def dc_can_i(interaction: discord.Interaction):
 
         file_name = random.choice(temp_files)
 
-    original = await asyncio.to_thread(
-        storage.get_yn,
-        file_name,
-    )
-
     await append_dc_log(
         f"{get_clean_time()} "
         f"{interaction.user.display_name} 使用了可以不可以，回覆了 {file_name}"
     )
 
-    await interaction.followup.send(
-        f"**{interaction.user.display_name}** 使用我可不可以..抽到了__{file_name}__",
-        file=dc_photo_file(original, file_name),
-    )
+    with tempfile.TemporaryFile() as photo_file:
+        await asyncio.to_thread(
+            storage.download_yn_to_file,
+            file_name,
+            photo_file,
+        )
+
+        await interaction.followup.send(
+            f"**{interaction.user.display_name}** 使用我可不可以..抽到了__{file_name}__",
+            file=File(photo_file, filename=file_name),
+        )
+
+    release_memory()
 
 
 # 原 Discord 程式中這兩個函數「沒有 @bot.tree.command decorator」。
@@ -294,18 +303,22 @@ async def dc_search(interaction: discord.Interaction, keyword: str):
         elif len(matching_files) == 1:
             await interaction.response.defer()
 
-            original = await asyncio.to_thread(
-                storage.get_meme,
-                matching_files[0],
-            )
-
-            await interaction.followup.send(
-                f"**{interaction.user.display_name}** 傳送了：__{matching_files[0]}__",
-                file=dc_photo_file(
-                    original,
+            with tempfile.TemporaryFile() as photo_file:
+                await asyncio.to_thread(
+                    storage.download_meme_to_file,
                     matching_files[0],
+                    photo_file,
                 )
-            )
+
+                await interaction.followup.send(
+                    f"**{interaction.user.display_name}** 傳送了：__{matching_files[0]}__",
+                    file=File(
+                        photo_file,
+                        filename=matching_files[0],
+                    )
+                )
+
+            release_memory()
 
         else:
             response = ""
@@ -503,11 +516,6 @@ async def tg_reply_to_photo(
         if random_file != "compressed.jpg":
             break
 
-    original = await asyncio.to_thread(
-        storage.get_airou,
-        random_file,
-    )
-
     # 完全保留原文，不自行新增「圖庫沒上傳」之類的訊息
     await update.message.reply_text(
         "我拿這張圖跟"
@@ -515,12 +523,19 @@ async def tg_reply_to_photo(
         + "交換！這是一張作者的照片"
     )
 
-    await update.message.reply_photo(
-        photo=tg_photo_file(
-            original,
+    with tempfile.TemporaryFile() as photo_file:
+        await asyncio.to_thread(
+            storage.download_airou_to_file,
             random_file,
+            photo_file,
         )
-    )
+
+        await update.message.reply_photo(
+            photo=photo_file,
+            filename=random_file,
+        )
+
+    release_memory()
 
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S') + " "
 
@@ -543,17 +558,19 @@ async def tg_random_image(
     files = await asyncio.to_thread(storage.list_memes)
     random_file = random.choice(files)
 
-    original = await asyncio.to_thread(
-        storage.get_meme,
-        random_file,
-    )
-
-    await update.message.reply_photo(
-        photo=tg_photo_file(
-            original,
+    with tempfile.TemporaryFile() as photo_file:
+        await asyncio.to_thread(
+            storage.download_meme_to_file,
             random_file,
+            photo_file,
         )
-    )
+
+        await update.message.reply_photo(
+            photo=photo_file,
+            filename=random_file,
+        )
+
+    release_memory()
 
     user = update.message.from_user
     user_full_name = user.full_name
@@ -586,17 +603,19 @@ async def tg_can_i(
 
     # 原碼這裡 photo_path 少接 /YN，屬於舊程式路徑 bug。
     # Railway storage 必須從實際 YN/ 取檔，否則功能無法成立。
-    original = await asyncio.to_thread(
-        storage.get_yn,
-        file_name,
-    )
-
-    await update.message.reply_photo(
-        photo=tg_photo_file(
-            original,
+    with tempfile.TemporaryFile() as photo_file:
+        await asyncio.to_thread(
+            storage.download_yn_to_file,
             file_name,
+            photo_file,
         )
-    )
+
+        await update.message.reply_photo(
+            photo=photo_file,
+            filename=file_name,
+        )
+
+    release_memory()
 
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S') + " "
 
@@ -699,19 +718,21 @@ async def tg_search_files(
                 )
 
         elif len(matching_files) == 1:
-            original = await asyncio.to_thread(
-                storage.get_meme,
-                matching_files[0],
-            )
-
-            # 不再 runtime 壓圖；Bucket JPEG 直接送出。
+            # 不再 runtime 壓圖；S3 串流到 TemporaryFile 後直接送出。
             # blackL 的文字彩蛋仍保留，但不再 quality=20 重壓圖片。
-            await update.message.reply_photo(
-                photo=tg_photo_file(
-                    original,
+            with tempfile.TemporaryFile() as photo_file:
+                await asyncio.to_thread(
+                    storage.download_meme_to_file,
                     matching_files[0],
+                    photo_file,
                 )
-            )
+
+                await update.message.reply_photo(
+                    photo=photo_file,
+                    filename=matching_files[0],
+                )
+
+            release_memory()
 
             if user_name in blackL:
                 await update.message.reply_text(
