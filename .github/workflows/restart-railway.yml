@@ -1,120 +1,66 @@
-name: Restart Railway Bot
+name: Test Railway Token
 
 on:
-  schedule:
-    # 每小時第 7 分鐘執行
-    - cron: "7 * * * *"
-
-  # 讓你可以在 GitHub Actions 手動按按鈕測試
   workflow_dispatch:
 
 jobs:
-  restart:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Restart Railway Bot
+      - name: Test Railway Project Token
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_PROJECT_TOKEN }}
-          SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
 
         run: |
           python3 - <<'PY'
           import os
           import json
           import urllib.request
+          import urllib.error
 
-          API = "https://backboard.railway.com/graphql/v2"
+          token = os.environ.get("RAILWAY_TOKEN", "")
 
-          token = os.environ["RAILWAY_TOKEN"]
-          service_id = os.environ["SERVICE_ID"]
-
-          def graphql(query, variables=None):
-              req = urllib.request.Request(
-                  API,
-                  data=json.dumps({
-                      "query": query,
-                      "variables": variables or {}
-                  }).encode(),
-                  headers={
-                      "Project-Access-Token": token,
-                      "Content-Type": "application/json",
-                  },
+          if not token:
+              raise RuntimeError(
+                  "RAILWAY_PROJECT_TOKEN 是空的，請檢查 GitHub Secrets"
               )
 
+          print("Token exists.")
+          print("Token length:", len(token))
+          print("Testing Railway API...")
+
+          body = json.dumps({
+              "query": """
+              query {
+                projectToken {
+                  projectId
+                  environmentId
+                }
+              }
+              """
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://backboard.railway.com/graphql/v2",
+              data=body,
+              headers={
+                  "Project-Access-Token": token,
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
               with urllib.request.urlopen(req) as response:
                   result = json.load(response)
 
-              if result.get("errors"):
-                  raise RuntimeError(result["errors"])
+              print(json.dumps(result, indent=2))
 
-              return result["data"]
+          except urllib.error.HTTPError as e:
+              print("HTTP status:", e.code)
+              print("Railway response:")
+              print(e.read().decode(errors="replace"))
+              raise
 
-          # 從 Project Token 取得 Project / Environment
-          info = graphql("""
-          query {
-            projectToken {
-              projectId
-              environmentId
-            }
-          }
-          """)
-
-          project_id = info["projectToken"]["projectId"]
-          environment_id = info["projectToken"]["environmentId"]
-
-          # 找 Bot 最新 deployment
-          deployments = graphql("""
-          query($input: DeploymentListInput!) {
-            deployments(input: $input, first: 10) {
-              edges {
-                node {
-                  id
-                  status
-                  createdAt
-                }
-              }
-            }
-          }
-          """, {
-              "input": {
-                  "projectId": project_id,
-                  "environmentId": environment_id,
-                  "serviceId": service_id
-              }
-          })
-
-          deployment = None
-
-          for edge in deployments["deployments"]["edges"]:
-              d = edge["node"]
-
-              if d["status"] in ("SUCCESS", "SLEEPING"):
-                  deployment = d
-                  break
-
-          if deployment is None:
-              raise RuntimeError("找不到可 restart 的 Railway deployment")
-
-          deployment_id = deployment["id"]
-
-          print(
-              "Restarting:",
-              deployment_id,
-              "status:",
-              deployment["status"]
-          )
-
-          result = graphql("""
-          mutation($id: String!) {
-            deploymentRestart(id: $id)
-          }
-          """, {
-              "id": deployment_id
-          })
-
-          print(
-              "Restart result:",
-              result["deploymentRestart"]
-          )
           PY
