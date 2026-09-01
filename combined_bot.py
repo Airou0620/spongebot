@@ -22,8 +22,8 @@ from telegram.ext import (
 )
 
 from storage import MemeStorage
-import sys
 
+import sys
 
 # ============================================================
 # 0. 必要的 Railway 改動
@@ -45,9 +45,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(message)s',
+    format="%(message)s",
     stream=sys.stdout,
-    force=True
+    force=True,
 )
 
 logger = logging.getLogger(__name__)
