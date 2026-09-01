@@ -26,6 +26,7 @@ from storage import MemeStorage
 
 import sys
 import tempfile
+from pathlib import Path
 
 # ============================================================
 # 0. 必要的 Railway 改動
@@ -496,16 +497,22 @@ async def tg_reply_to_photo(
 
     # 下載 Telegram 收到的圖片
     photo = await update.message.photo[-1].get_file()
-    received_data = bytes(await photo.download_as_bytearray())
 
-    # 原本檔名就是 {user_full_name}{num}.jpg
     received_filename = f"{user_full_name}{num}.jpg"
-
-    # 改成持久存 Railway Bucket / PhotoReceived/
-    await asyncio.to_thread(
-        storage.save_received,
-        received_filename,
-        received_data,
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / received_filename
+    
+        # Telegram → disk，不建立整張 bytearray
+        await photo.download_to_drive(
+            custom_path=temp_path
+        )
+    
+        # disk → Railway Bucket
+        await asyncio.to_thread(
+            storage.save_received_file,
+            received_filename,
+            temp_path,
     )
 
     # 原本 while True 排除 compressed.jpg
