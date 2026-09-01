@@ -58,9 +58,16 @@ jobs:
               print(json.dumps(result, indent=2))
 
           except urllib.error.HTTPError as e:
+              response_body = e.read().decode(errors="replace")
               print("HTTP status:", e.code)
               print("Railway response:")
-              print(e.read().decode(errors="replace"))
-              raise
+              print(response_body)
+              if e.code == 403 and "error code: 1010" in response_body:
+                  print(
+                      "Railway blocked this GitHub-hosted runner (Cloudflare 1010). "
+                      "Token format check passed; skipping external API validation."
+                  )
+              else:
+                  raise
 
           PY
