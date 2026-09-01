@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+*.log
+_compress_errors.txt
+_upload_errors.txt
