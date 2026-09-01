@@ -438,7 +438,7 @@ async def tg_reply_to_sticker(
         '是什麼樣的刺激讓你想傳貼圖給一個機器人',
         '嗶嗶，機油好好喝',
         '吃著火鍋唱著歌，突然傳貼圖是什麼意思',
-        'Service provided by PythonAnyWhere, beep beep',
+        'Service provided by Railway, beep beep',
         '艾璐教授加博士先生並沒有讓我學會看貼圖',
         '作者是隻大貓咪，叫他小貓咪他會生氣\nhttps://x.com/AirouCat620/status/1769713690570551797',
         '我不接受吃咖哩會拌的人用我做的Bot -Airou',
