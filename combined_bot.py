@@ -1,12 +1,12 @@
 import asyncio
 import ctypes
 import gc
-import io
 import logging
 import os
 import random
 import signal
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from time import time
 
@@ -134,18 +134,6 @@ def get_clean_time():
 # ============================================================
 # Bucket 內圖片已預先壓縮，因此 Railway 執行時不再 Pillow decode / resize /
 # JPEG encode。直接把 Bucket bytes 傳給 Discord / Telegram，降低 RAM 與 CPU。
-
-
-def tg_photo_file(data: bytes, filename="photo.jpg"):
-    bio = io.BytesIO(data)
-    bio.name = filename
-    bio.seek(0)
-    return bio
-
-
-def dc_photo_file(data: bytes, filename: str):
-    """把 Bucket bytes 直接包成 Discord File，不做圖片解碼/重壓。"""
-    return File(io.BytesIO(data), filename=filename)
 
 
 # ============================================================
@@ -850,6 +838,15 @@ async def main():
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    # 這個 Bot 的 blocking 工作只有少量 S3 / file I/O。
+    # 限制 default executor 避免 asyncio.to_thread() 在尖峰建立太多 thread，
+    # 用一點排隊時間換較低 RAM。
+    loop.set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=int(os.getenv("MAX_IO_WORKERS", "2"))
+        )
+    )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
