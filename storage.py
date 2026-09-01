@@ -228,4 +228,9 @@ class MemeStorage:
                 ContentType="text/plain; charset=utf-8",
             )
 
+            print(
+            f"[BucketLog] WRITE OK bucket={self.bucket} key={key} bytes={len(data)}",
+            flush=True
+            )
+            
         return key
