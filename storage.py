@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import tempfile
 from pathlib import PurePosixPath
 
 import boto3
@@ -73,6 +74,9 @@ class MemeStorage:
                 signature_version="s3v4",
                 s3={"addressing_style": "virtual"},
                 retries={"max_attempts": 5, "mode": "standard"},
+                max_pool_connections=int(
+                    os.getenv("S3_MAX_POOL_CONNECTIONS", "2")
+                ),
             ),
         )
 
@@ -265,34 +269,43 @@ class MemeStorage:
 
     def append_text_log(self, filename: str, line: str) -> str:
         """
-        S3 本身沒有 append，所以用 get -> append -> put，
-        讓 Bucket 裡仍保持與原程式一樣的一個 .log 檔。
+        保留原本單一 searchTG_output.log / searchDC_output.log 行為，
+        但不再把整份舊 log 讀進 Python heap。
 
-        Bucket/logs/searchTG_output.log
-        Bucket/logs/searchDC_output.log
+        流程：
+          Bucket old log -> TemporaryFile (64 KiB streaming)
+          -> append one line
+          -> TemporaryFile -> Bucket
+
+        S3 本身沒有 append，所以仍需整個 object 重寫；
+        只是把暫存從 Python heap 移到 ephemeral disk。
         """
         key = self._join(self.log_prefix, filename)
-        new_line = str(line) + "\n"
+        new_line = (str(line) + "\n").encode("utf-8")
 
         with self._log_lock:
-            old = b""
+            with tempfile.TemporaryFile() as log_file:
+                try:
+                    self._download_to_file(key, log_file)
+                except ClientError as e:
+                    code = e.response.get("Error", {}).get("Code", "")
+                    if code not in ("NoSuchKey", "404"):
+                        raise
 
-            try:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-                old = obj["Body"].read()
-            except ClientError as e:
-                code = e.response.get("Error", {}).get("Code", "")
-                if code not in ("NoSuchKey", "404"):
-                    raise
+                    log_file.seek(0)
+                    log_file.truncate(0)
 
-            data = old + new_line.encode("utf-8")
+                log_file.seek(0, os.SEEK_END)
+                log_file.write(new_line)
+                log_file.flush()
+                log_file.seek(0)
 
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=data,
-                ContentType="text/plain; charset=utf-8",
-            )
+                self.s3.put_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Body=log_file,
+                    ContentType="text/plain; charset=utf-8",
+                )
 
         return key
 
