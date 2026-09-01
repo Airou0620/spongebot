@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 
 from storage import MemeStorage
+import sys
 
 
 # ============================================================
@@ -42,7 +43,12 @@ storage = MemeStorage()
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    stream=sys.stdout,
+    force=True
+)
 
 logger = logging.getLogger(__name__)
 
