@@ -2,7 +2,7 @@ name: Restart Railway Bot
 
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "12 * * * *"
 
   workflow_dispatch:
 
