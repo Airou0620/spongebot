@@ -486,7 +486,10 @@ async def tg_reply_to_photo(
     # 下載 Telegram 收到的圖片
     photo = await update.message.photo[-1].get_file()
 
-    received_filename = f"{user_full_name}{num}.jpg"
+    received_filename = (
+        f"{user_full_name}{num}_"
+        f"{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
+    )
     
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir) / received_filename
