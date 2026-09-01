@@ -1,66 +1,138 @@
-name: Test Railway Token
+name: Restart Railway Bot
 
 on:
+  schedule:
+    - cron: "7 * * * *"
+
   workflow_dispatch:
 
 jobs:
-  test:
+  restart:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Railway Project Token
+      - name: Restart Railway Bot
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_PROJECT_TOKEN }}
+          SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
 
         run: |
-          python3 - <<'PY'
-          import os
-          import json
-          import urllib.request
-          import urllib.error
+          set -e
 
-          token = os.environ.get("RAILWAY_TOKEN", "")
+          API="https://backboard.railway.com/graphql/v2"
 
-          if not token:
-              raise RuntimeError(
-                  "RAILWAY_PROJECT_TOKEN 是空的，請檢查 GitHub Secrets"
-              )
+          echo "Testing Railway token..."
 
-          print("Token exists.")
-          print("Token length:", len(token))
-          print("Testing Railway API...")
+          TOKEN_INFO=$(curl --fail-with-body -sS \
+            -X POST "$API" \
+            -H "Project-Access-Token: $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: Mozilla/5.0" \
+            --data '{"query":"query { projectToken { projectId environmentId } }"}')
 
-          body = json.dumps({
-              "query": """
-              query {
-                projectToken {
-                  projectId
-                  environmentId
-                }
-              }
-              """
-          }).encode()
+          echo "$TOKEN_INFO"
 
-          req = urllib.request.Request(
-              "https://backboard.railway.com/graphql/v2",
-              data=body,
-              headers={
-                  "Project-Access-Token": token,
-                  "Content-Type": "application/json",
-              },
-              method="POST",
+          export TOKEN_INFO
+
+          PROJECT_ID=$(python3 - <<'PY'
+          import json, os
+
+          data = json.loads(os.environ["TOKEN_INFO"])
+
+          if data.get("errors"):
+              raise RuntimeError(data["errors"])
+
+          print(data["data"]["projectToken"]["projectId"])
+          PY
           )
 
-          try:
-              with urllib.request.urlopen(req) as response:
-                  result = json.load(response)
+          ENVIRONMENT_ID=$(python3 - <<'PY'
+          import json, os
 
-              print(json.dumps(result, indent=2))
-
-          except urllib.error.HTTPError as e:
-              print("HTTP status:", e.code)
-              print("Railway response:")
-              print(e.read().decode(errors="replace"))
-              raise
-
+          data = json.loads(os.environ["TOKEN_INFO"])
+          print(data["data"]["projectToken"]["environmentId"])
           PY
+          )
+
+          echo "Project: $PROJECT_ID"
+          echo "Environment: $ENVIRONMENT_ID"
+          echo "Service: $SERVICE_ID"
+
+          DEPLOYMENTS=$(curl --fail-with-body -sS \
+            -X POST "$API" \
+            -H "Project-Access-Token: $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: Mozilla/5.0" \
+            --data "$(python3 - <<PY
+          import json
+
+          print(json.dumps({
+              "query": """
+              query(\$input: DeploymentListInput!) {
+                deployments(input: \$input, first: 10) {
+                  edges {
+                    node {
+                      id
+                      status
+                      createdAt
+                    }
+                  }
+                }
+              }
+              """,
+              "variables": {
+                  "input": {
+                      "projectId": "$PROJECT_ID",
+                      "environmentId": "$ENVIRONMENT_ID",
+                      "serviceId": "$SERVICE_ID"
+                  }
+              }
+          }))
+          PY
+          )")
+
+          export DEPLOYMENTS
+
+          DEPLOYMENT_ID=$(python3 - <<'PY'
+          import json, os
+
+          data = json.loads(os.environ["DEPLOYMENTS"])
+
+          if data.get("errors"):
+              raise RuntimeError(data["errors"])
+
+          for edge in data["data"]["deployments"]["edges"]:
+              d = edge["node"]
+
+              if d["status"] in ("SUCCESS", "SLEEPING"):
+                  print(d["id"])
+                  break
+          else:
+              raise RuntimeError("找不到目前可 restart 的 deployment")
+          PY
+          )
+
+          echo "Restarting deployment: $DEPLOYMENT_ID"
+
+          RESTART_RESULT=$(curl --fail-with-body -sS \
+            -X POST "$API" \
+            -H "Project-Access-Token: $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: Mozilla/5.0" \
+            --data "$(python3 - <<PY
+          import json
+
+          print(json.dumps({
+              "query": """
+              mutation(\$id: String!) {
+                deploymentRestart(id: \$id)
+              }
+              """,
+              "variables": {
+                  "id": "$DEPLOYMENT_ID"
+              }
+          }))
+          PY
+          )")
+
+          echo "$RESTART_RESULT"
