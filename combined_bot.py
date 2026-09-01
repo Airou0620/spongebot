@@ -65,7 +65,7 @@ async def append_tg_log(message, level="info"):
 
     差別只有 .log 改存在 Bucket，避免 Railway redeploy 消失。
     """
-    message = str(message)
+    message = "[Telegram] " + str(message)
 
     if level == "error":
         logger.error(message)
@@ -91,7 +91,7 @@ async def append_dc_log(message, level="info"):
 
     差別只有 .log 改存在 Bucket。
     """
-    message = str(message)
+    message = "[Discord] " + str(message)
 
     if level == "error":
         logger.error(message)
