@@ -159,7 +159,7 @@ def compress_discord_bytes(
 
 def compress_telegram_bytes(
     image_data: bytes,
-    quality=50,
+    quality=70,
     max_length=1280,
 ) -> bytes:
     """
