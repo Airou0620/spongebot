@@ -13,7 +13,6 @@ from time import time
 import discord
 from discord import Intents, File
 from discord.ext import commands
-from PIL import Image
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -58,34 +57,18 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("discord.client").setLevel(logging.ERROR)
 logging.getLogger("discord.gateway").setLevel(logging.ERROR)
 
-
-# ============================================================
-# Memory release
-# ============================================================
-# Python / Pillow 釋放物件後，glibc 不一定會立即把 heap 還給 Linux。
-# Railway Metrics 看的是 process RSS，所以圖片處理完後：
-#   1. gc.collect() 回收 Python 物件
-#   2. malloc_trim(0) 嘗試把可釋放 heap pages 還給 OS
-#
-# 只在圖片處理完成後呼叫，不改 Bot 邏輯，也不在每個純文字查詢呼叫。
 try:
-    _libc = (
-        ctypes.CDLL("libc.so.6")
-        if sys.platform.startswith("linux")
-        else None
-    )
+    _libc = ctypes.CDLL("libc.so.6") if sys.platform.startswith("linux") else None
 except OSError:
     _libc = None
 
 
 def release_memory():
     gc.collect()
-
     if _libc is not None:
         try:
             _libc.malloc_trim(0)
         except Exception:
-            # 記憶體釋放失敗不能影響 Bot 主功能
             pass
 
 
@@ -145,91 +128,10 @@ def get_clean_time():
 
 
 # ============================================================
-# 2. 圖片壓縮：分開保留兩個版本原本參數
+# 2. 圖片傳送
 # ============================================================
-
-def compress_discord_bytes(
-    image_data: bytes,
-    quality=70,
-    max_length=1500,
-) -> bytes:
-    """
-    原 Discord：
-      quality=70
-      max_length=1500
-      RGBA/P -> RGB
-      JPEG
-    """
-    output = io.BytesIO()
-
-    with Image.open(io.BytesIO(image_data)) as img:
-        exif = img._getexif()
-
-        if exif:
-            orientation = exif.get(0x0112, 1)
-
-            if orientation in [3, 6, 8]:
-                rotation = {3: 180, 6: 270, 8: 90}[orientation]
-                img = img.rotate(rotation, expand=True)
-
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-
-        img.thumbnail(
-            (max_length, max_length),
-            Image.Resampling.LANCZOS,
-        )
-
-        img.save(
-            output,
-            "JPEG",
-            quality=quality,
-        )
-
-    return output.getvalue()
-
-
-def compress_telegram_bytes(
-    image_data: bytes,
-    quality=70,
-    max_length=1280,
-) -> bytes:
-    """
-    原 Telegram：
-      quality=50
-      max_length=1280
-      EXIF rotation
-    """
-    output = io.BytesIO()
-
-    with Image.open(io.BytesIO(image_data)) as img:
-        exif = img._getexif()
-
-        if exif:
-            orientation = exif.get(0x0112, 1)
-
-            if orientation in [3, 6, 8]:
-                rotation = {3: 180, 6: 270, 8: 90}[orientation]
-                img = img.rotate(rotation, expand=True)
-
-        img.thumbnail(
-            (max_length, max_length),
-            Image.Resampling.LANCZOS,
-        )
-
-        # Bucket 主圖已是 JPEG，因此正常會是 RGB。
-        # 若意外收到有 alpha 的格式，只做 Railway 必要相容處理，
-        # 不改 quality / 尺寸邏輯。
-        if img.mode in ("RGBA", "P", "LA"):
-            img = img.convert("RGB")
-
-        img.save(
-            output,
-            "JPEG",
-            quality=quality,
-        )
-
-    return output.getvalue()
+# Bucket 內圖片已預先壓縮，因此 Railway 執行時不再 Pillow decode / resize /
+# JPEG encode。直接把 Bucket bytes 傳給 Discord / Telegram，降低 RAM 與 CPU。
 
 
 def tg_photo_file(data: bytes, filename="photo.jpg"):
@@ -237,6 +139,11 @@ def tg_photo_file(data: bytes, filename="photo.jpg"):
     bio.name = filename
     bio.seek(0)
     return bio
+
+
+def dc_photo_file(data: bytes, filename: str):
+    """把 Bucket bytes 直接包成 Discord File，不做圖片解碼/重壓。"""
+    return File(io.BytesIO(data), filename=filename)
 
 
 # ============================================================
@@ -298,11 +205,6 @@ async def dc_random(interaction: discord.Interaction):
         random_file,
     )
 
-    compressed = await asyncio.to_thread(
-        compress_discord_bytes,
-        original,
-    )
-
     await append_dc_log(
         f"{get_clean_time()} "
         f"{interaction.user.display_name} 使用了抽，回覆了 {random_file}"
@@ -310,15 +212,8 @@ async def dc_random(interaction: discord.Interaction):
 
     await interaction.followup.send(
         f"**{interaction.user.display_name}** 使用隨機抽圖抽到了__{random_file}__",
-        file=File(
-            io.BytesIO(compressed),
-            filename="compressed_rnd.jpg",
-        ),
+        file=dc_photo_file(original, random_file),
     )
-
-    # 圖片已送出，釋放下載原圖與壓縮圖 bytes。
-    del original, compressed
-    release_memory()
 
 
 @discord_bot.tree.command(name="can_i", description="我可不可以..?")
@@ -345,11 +240,6 @@ async def dc_can_i(interaction: discord.Interaction):
         file_name,
     )
 
-    compressed = await asyncio.to_thread(
-        compress_discord_bytes,
-        original,
-    )
-
     await append_dc_log(
         f"{get_clean_time()} "
         f"{interaction.user.display_name} 使用了可以不可以，回覆了 {file_name}"
@@ -357,14 +247,8 @@ async def dc_can_i(interaction: discord.Interaction):
 
     await interaction.followup.send(
         f"**{interaction.user.display_name}** 使用我可不可以..抽到了__{file_name}__",
-        file=File(
-            io.BytesIO(compressed),
-            filename="compressed_yn.jpg",
-        ),
+        file=dc_photo_file(original, file_name),
     )
-
-    del original, compressed
-    release_memory()
 
 
 # 原 Discord 程式中這兩個函數「沒有 @bot.tree.command decorator」。
@@ -415,21 +299,13 @@ async def dc_search(interaction: discord.Interaction, keyword: str):
                 matching_files[0],
             )
 
-            compressed = await asyncio.to_thread(
-                compress_discord_bytes,
-                original,
-            )
-
             await interaction.followup.send(
                 f"**{interaction.user.display_name}** 傳送了：__{matching_files[0]}__",
-                file=File(
-                    io.BytesIO(compressed),
-                    filename="compressed.jpg",
+                file=dc_photo_file(
+                    original,
+                    matching_files[0],
                 )
             )
-
-            del original, compressed
-            release_memory()
 
         else:
             response = ""
@@ -549,7 +425,7 @@ async def tg_reply_to_sticker(
         '是什麼樣的刺激讓你想傳貼圖給一個機器人',
         '嗶嗶，機油好好喝',
         '吃著火鍋唱著歌，突然傳貼圖是什麼意思',
-        'Service provided by Railway, beep beep',
+        'Service provided by PythonAnyWhere, beep beep',
         '艾璐教授加博士先生並沒有讓我學會看貼圖',
         '作者是隻大貓咪，叫他小貓咪他會生氣\nhttps://x.com/AirouCat620/status/1769713690570551797',
         '我不接受吃咖哩會拌的人用我做的Bot -Airou',
@@ -632,11 +508,6 @@ async def tg_reply_to_photo(
         random_file,
     )
 
-    compressed = await asyncio.to_thread(
-        compress_telegram_bytes,
-        original,
-    )
-
     # 完全保留原文，不自行新增「圖庫沒上傳」之類的訊息
     await update.message.reply_text(
         "我拿這張圖跟"
@@ -646,8 +517,8 @@ async def tg_reply_to_photo(
 
     await update.message.reply_photo(
         photo=tg_photo_file(
-            compressed,
-            "compressed.jpg",
+            original,
+            random_file,
         )
     )
 
@@ -664,10 +535,6 @@ async def tg_reply_to_photo(
         + f"{storage.airou_prefix}/{random_file}"
     )
 
-    # 收到的照片已存 Bucket，交換圖片也已送出。
-    del photo, received_data, original, compressed
-    release_memory()
-
 
 async def tg_random_image(
     update: Update,
@@ -681,15 +548,10 @@ async def tg_random_image(
         random_file,
     )
 
-    compressed = await asyncio.to_thread(
-        compress_telegram_bytes,
-        original,
-    )
-
     await update.message.reply_photo(
         photo=tg_photo_file(
-            compressed,
-            "compressed.jpg",
+            original,
+            random_file,
         )
     )
 
@@ -703,9 +565,6 @@ async def tg_random_image(
         + "使用了抽，回覆了"
         + random_file
     )
-
-    del original, compressed
-    release_memory()
 
 
 async def tg_can_i(
@@ -732,15 +591,10 @@ async def tg_can_i(
         file_name,
     )
 
-    compressed = await asyncio.to_thread(
-        compress_telegram_bytes,
-        original,
-    )
-
     await update.message.reply_photo(
         photo=tg_photo_file(
-            compressed,
-            "compressed.jpg",
+            original,
+            file_name,
         )
     )
 
@@ -752,9 +606,6 @@ async def tg_can_i(
         + "使用了可以不可以，回覆了"
         + file_name
     )
-
-    del original, compressed
-    release_memory()
 
 
 async def tg_airou(
@@ -853,23 +704,12 @@ async def tg_search_files(
                 matching_files[0],
             )
 
-            if user_name in blackL:
-                compressed = await asyncio.to_thread(
-                    compress_telegram_bytes,
-                    original,
-                    20,
-                    1280,
-                )
-            else:
-                compressed = await asyncio.to_thread(
-                    compress_telegram_bytes,
-                    original,
-                )
-
+            # 不再 runtime 壓圖；Bucket JPEG 直接送出。
+            # blackL 的文字彩蛋仍保留，但不再 quality=20 重壓圖片。
             await update.message.reply_photo(
                 photo=tg_photo_file(
-                    compressed,
-                    "compressed.jpg",
+                    original,
+                    matching_files[0],
                 )
             )
 
@@ -880,9 +720,6 @@ async def tg_search_files(
                 await append_tg_log(
                     "回覆糊糊的圖"
                 )
-
-            del original, compressed
-            release_memory()
 
         else:
             response = ""
