@@ -4,6 +4,8 @@ import os
 import shutil
 import threading
 import tempfile
+import time
+from datetime import datetime
 from pathlib import PurePosixPath
 
 import boto3
@@ -63,6 +65,10 @@ class MemeStorage:
         self.airou_prefix = os.getenv("AIROU_PREFIX", "airou").strip("/")
         self.received_prefix = os.getenv("RECEIVED_PREFIX", "PhotoReceived").strip("/")
         self.log_prefix = os.getenv("LOG_PREFIX", "logs").strip("/")
+        self.index_ttl = max(0.0, float(os.getenv("S3_INDEX_TTL", "300")))
+        self.log_rotate_bytes = max(
+            0, int(os.getenv("LOG_ROTATE_BYTES", "1048576"))
+        )
 
         self.s3 = boto3.client(
             "s3",
@@ -81,6 +87,8 @@ class MemeStorage:
         )
 
         self._log_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+        self._index_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 
     @staticmethod
     def _is_image(key: str) -> bool:
@@ -95,29 +103,58 @@ class MemeStorage:
     def _list_keys(self, prefix: str) -> list[str]:
         prefix = prefix.strip("/")
         query = f"{prefix}/" if prefix else ""
+        now = time.monotonic()
 
-        result: list[str] = []
-        paginator = self.s3.get_paginator("list_objects_v2")
+        with self._index_lock:
+            cached = self._index_cache.get(query)
+            if cached and now < cached[0]:
+                return list(cached[1])
 
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=query):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if self._is_image(key):
-                    result.append(key)
+            result: list[str] = []
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=query):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if self._is_image(key):
+                        result.append(key)
 
-        return result
+            snapshot = tuple(result)
+            if self.index_ttl:
+                self._index_cache[query] = (now + self.index_ttl, snapshot)
+            return list(snapshot)
+
+    def _list_top_level_images(self, prefix: str) -> list[str]:
+        """Ask S3 for only this virtual directory; don't enumerate child folders."""
+        prefix = prefix.strip("/")
+        query = f"{prefix}/" if prefix else ""
+        cache_key = query + "|top"
+        now = time.monotonic()
+
+        with self._index_lock:
+            cached = self._index_cache.get(cache_key)
+            if cached and now < cached[0]:
+                return list(cached[1])
+
+            result: list[str] = []
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=self.bucket, Prefix=query, Delimiter="/"
+            ):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    rel = key[len(query):] if key.startswith(query) else key
+                    if rel and "/" not in rel and self._is_image(rel):
+                        result.append(rel)
+
+            result.sort()
+            snapshot = tuple(result)
+            if self.index_ttl:
+                self._index_cache[cache_key] = (now + self.index_ttl, snapshot)
+            return list(snapshot)
 
     def list_memes(self) -> list[str]:
         """等價於原本 os.listdir(dir_path) 後取頂層圖片。"""
-        root = f"{self.meme_prefix}/"
-        result = []
-
-        for key in self._list_keys(self.meme_prefix):
-            rel = key[len(root):] if key.startswith(root) else key
-            if rel and "/" not in rel:
-                result.append(rel)
-
-        return sorted(result)
+        return self._list_top_level_images(self.meme_prefix)
 
     def list_yn(self) -> list[str]:
         """等價於原本 os.listdir(dir_path + "/YN")。"""
@@ -286,6 +323,40 @@ class MemeStorage:
         with self._log_lock:
             with tempfile.TemporaryFile() as log_file:
                 try:
+                    if self.log_rotate_bytes:
+                        try:
+                            size = self.s3.head_object(
+                                Bucket=self.bucket, Key=key
+                            ).get("ContentLength", 0)
+                        except ClientError as e:
+                            code = e.response.get("Error", {}).get("Code", "")
+                            if code not in ("NoSuchKey", "404"):
+                                raise
+                            size = 0
+
+                        if size + len(new_line) > self.log_rotate_bytes:
+                            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+                            archive_key = self._join(
+                                self.log_prefix,
+                                f"archive/{filename}.{stamp}.log",
+                            )
+                            if size:
+                                self.s3.copy_object(
+                                    Bucket=self.bucket,
+                                    Key=archive_key,
+                                    CopySource={"Bucket": self.bucket, "Key": key},
+                                )
+                            log_file.write(new_line)
+                            log_file.flush()
+                            log_file.seek(0)
+                            self.s3.put_object(
+                                Bucket=self.bucket,
+                                Key=key,
+                                Body=log_file,
+                                ContentType="text/plain; charset=utf-8",
+                            )
+                            return key
+
                     self._download_to_file(key, log_file)
                 except ClientError as e:
                     code = e.response.get("Error", {}).get("Code", "")
