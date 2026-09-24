@@ -1,0 +1,11 @@
+{
+  "scope": "offline fake-S3 microbenchmark, NOT Railway RSS",
+  "python": "3.13.5",
+  "filenames": 10000,
+  "searches": 1000,
+  "additional_s3_list_calls": 0,
+  "same_tuple_identity": true,
+  "snapshot_tuple_plus_strings_bytes": 1060040,
+  "search_tracemalloc_peak_bytes": 537,
+  "elapsed_seconds_with_tracemalloc": 6.4939
+}
