@@ -4,13 +4,14 @@ import os
 import shutil
 import threading
 import tempfile
-import time
 from datetime import datetime
 from pathlib import PurePosixPath
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from catalog_index import CatalogSnapshot, FilenameIndex
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -28,26 +29,14 @@ def _env(primary: str, fallback: str | None = None, default: str | None = None) 
 
 
 class MemeStorage:
-    """
-    Railway S3-compatible Bucket storage.
+    """Railway S3 storage with a resident, immutable filename index.
 
-    預設 Bucket 結構：
-      memes/
-        *.jpg
-        YN/*.jpg
-
-      airou/
-        *.jpg
-      或舊資料夾名稱：
-      Airou/
-        *.jpg
-
-      PhotoReceived/
-        <user><num>.jpg
-
-      logs/
-        searchTG_output.log
-        searchDC_output.log
+    Construction warms memes/, memes/YN/ and airou/ (legacy Airou/ fallback)
+    before returning, so none of the three bot entrypoints serves a cold index.
+    Exactly one maintenance worker refreshes filenames every 900 seconds by
+    default. Reads never trigger a LIST request, even after an update failure.
+    Images remain in S3; only names are cached. Call close() when disposing of
+    a storage instance; normal process exit also stops scheduling refreshes.
     """
 
     def __init__(self):
@@ -65,11 +54,14 @@ class MemeStorage:
         self.airou_prefix = os.getenv("AIROU_PREFIX", "airou").strip("/")
         self.received_prefix = os.getenv("RECEIVED_PREFIX", "PhotoReceived").strip("/")
         self.log_prefix = os.getenv("LOG_PREFIX", "logs").strip("/")
-        self.index_ttl = max(0.0, float(os.getenv("S3_INDEX_TTL", "300")))
         self.log_rotate_bytes = max(
             0, int(os.getenv("LOG_ROTATE_BYTES", "1048576"))
         )
-
+        # S3_INDEX_TTL is deliberately not used: reads must never expire.
+        self._index = FilenameIndex(
+            self._load_catalog,
+            interval=float(os.getenv("S3_INDEX_REFRESH_SECONDS", "900")),
+        )
         self.s3 = boto3.client(
             "s3",
             endpoint_url=self.endpoint,
@@ -85,10 +77,14 @@ class MemeStorage:
                 ),
             ),
         )
-
         self._log_lock = threading.Lock()
-        self._index_lock = threading.Lock()
-        self._index_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+        try:
+            self.refresh()
+            self._index.start()
+        except BaseException:
+            self._index.close()
+            self.s3.close()
+            raise
 
     @staticmethod
     def _is_image(key: str) -> bool:
@@ -100,95 +96,63 @@ class MemeStorage:
             return f"{prefix}/{name}"
         return prefix or name
 
-    def _list_keys(self, prefix: str) -> list[str]:
+    def _scan_names(self, prefix: str) -> tuple[str, ...]:
+        """Refresh-only listing, one page at a time; never recurse into children."""
         prefix = prefix.strip("/")
         query = f"{prefix}/" if prefix else ""
-        now = time.monotonic()
+        names = []
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.bucket, Prefix=query, Delimiter="/",
+        ):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.startswith(query):
+                    continue
+                name = key[len(query):]
+                if name and "/" not in name and self._is_image(name):
+                    names.append(name)
+        names.sort()
+        return tuple(names)
 
-        with self._index_lock:
-            cached = self._index_cache.get(query)
-            if cached and now < cached[0]:
-                return list(cached[1])
+    def _load_catalog(self) -> CatalogSnapshot:
+        memes = self._scan_names(self.meme_prefix)
+        yn = self._scan_names(self._join(self.meme_prefix, "YN"))
+        airou = self._scan_names(self.airou_prefix)
+        if not airou and self.airou_prefix != "Airou":
+            airou = self._scan_names("Airou")
+        return CatalogSnapshot(memes=memes, yn=yn, airou=airou)
 
-            result: list[str] = []
-            paginator = self.s3.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self.bucket, Prefix=query):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if self._is_image(key):
-                        result.append(key)
+    def refresh(self) -> dict[str, int]:
+        """Explicit startup/admin refresh, compatible with the standalone bots."""
+        snapshot = self._index.refresh()
+        return {
+            "memes": len(snapshot.memes),
+            "yn": len(snapshot.yn),
+            "airou": len(snapshot.airou),
+        }
 
-            snapshot = tuple(result)
-            if self.index_ttl:
-                self._index_cache[query] = (now + self.index_ttl, snapshot)
-            return list(snapshot)
-
-    def _list_top_level_images(self, prefix: str) -> list[str]:
-        """Ask S3 for only this virtual directory; don't enumerate child folders."""
-        prefix = prefix.strip("/")
-        query = f"{prefix}/" if prefix else ""
-        cache_key = query + "|top"
-        now = time.monotonic()
-
-        with self._index_lock:
-            cached = self._index_cache.get(cache_key)
-            if cached and now < cached[0]:
-                return list(cached[1])
-
-            result: list[str] = []
-            paginator = self.s3.get_paginator("list_objects_v2")
-            for page in paginator.paginate(
-                Bucket=self.bucket, Prefix=query, Delimiter="/"
-            ):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    rel = key[len(query):] if key.startswith(query) else key
-                    if rel and "/" not in rel and self._is_image(rel):
-                        result.append(rel)
-
-            result.sort()
-            snapshot = tuple(result)
-            if self.index_ttl:
-                self._index_cache[cache_key] = (now + self.index_ttl, snapshot)
-            return list(snapshot)
-
-    def list_memes(self) -> list[str]:
-        """等價於原本 os.listdir(dir_path) 後取頂層圖片。"""
-        return self._list_top_level_images(self.meme_prefix)
+    def list_memes(self) -> tuple[str, ...]:
+        """Return the same immutable tuple; O(1), no LIST, TTL, lock or list copy."""
+        return self._index.snapshot.memes
 
     def list_yn(self) -> list[str]:
-        """等價於原本 os.listdir(dir_path + "/YN")。"""
-        prefix = self._join(self.meme_prefix, "YN")
-        root = f"{prefix}/"
-        result = []
+        """Only this small catalog is copied: legacy tg_can_i() calls remove()."""
+        return list(self._index.snapshot.yn)
 
-        for key in self._list_keys(prefix):
-            rel = key[len(root):] if key.startswith(root) else key
-            if rel and "/" not in rel:
-                result.append(rel)
+    def list_airou(self) -> tuple[str, ...]:
+        return self._index.snapshot.airou
 
-        return sorted(result)
+    def search_memes(self, keyword: str) -> list[str]:
+        """Standalone-bot compatibility; substring search over RAM, not S3."""
+        needle = keyword.lower()
+        return [name for name in self.list_memes() if needle in name.lower()]
 
-    def list_airou(self) -> list[str]:
-        """
-        等價於原本 os.listdir(.../Airou)。
-        先用目前 Railway 上傳慣例 airou/；若空，再相容 Airou/。
-        """
-        prefixes = [self.airou_prefix]
-        if self.airou_prefix != "Airou":
-            prefixes.append("Airou")
-
-        for prefix in prefixes:
-            root = f"{prefix}/"
-            result = []
-            for key in self._list_keys(prefix):
-                rel = key[len(root):] if key.startswith(root) else key
-                if rel and "/" not in rel:
-                    result.append(rel)
-            if result:
-                return sorted(result)
-
-        return []
+    def close(self) -> None:
+        if self._index.close():
+            self.s3.close()
+        # If a refresh is still inside an S3 timeout, keep its pool alive until
+        # the owner is disposed; close() never schedules another refresh.
 
     def _get_bytes(self, key: str) -> bytes:
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
