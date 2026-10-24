@@ -81,7 +81,7 @@ class StorageTests(unittest.TestCase):
         env = {
             **ENV,
             "ENDPOINT": " https://storage.invalid ",
-            "ACCESS_KEY_ID": " key-with-padding\\n",
+            "ACCESS_KEY_ID": " key-with-padding\n",
             "SECRET_ACCESS_KEY": " secret-with-padding ",
         }
         fake = FakeS3()
