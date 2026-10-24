@@ -96,6 +96,46 @@ class StorageTests(unittest.TestCase):
                 finally:
                     storage.close()
 
+    def test_railway_bucket_url_style_environment_variable_is_honored(self):
+        # Railway's credential panel can designate path-style for older buckets.
+        for url_style in ("virtual", "path"):
+            with self.subTest(url_style=url_style):
+                env = {
+                    **ENV,
+                    "ENDPOINT": "https://t3.storageapi.dev",
+                    "AWS_S3_URL_STYLE": url_style,
+                }
+                fake = FakeS3()
+                with patch.dict("os.environ", env, clear=True):
+                    with patch("storage.boto3.client", return_value=fake) as factory:
+                        storage = MemeStorage()
+                        try:
+                            kwargs = factory.call_args.kwargs
+                            self.assertEqual(
+                                kwargs["config"].s3["addressing_style"], url_style
+                            )
+                        finally:
+                            storage.close()
+
+    def test_app_addressing_style_overrides_railway_url_style(self):
+        env = {
+            **ENV,
+            "ENDPOINT": "https://t3.storageapi.dev",
+            "AWS_S3_URL_STYLE": "virtual",
+            "S3_ADDRESSING_STYLE": "path",
+        }
+        fake = FakeS3()
+        with patch.dict("os.environ", env, clear=True):
+            with patch("storage.boto3.client", return_value=fake) as factory:
+                storage = MemeStorage()
+                try:
+                    self.assertEqual(
+                        factory.call_args.kwargs["config"].s3["addressing_style"],
+                        "path",
+                    )
+                finally:
+                    storage.close()
+
     def test_cloudflare_r2_uses_auto_region_and_path_style(self):
         # R2 must use the "auto" signing region even if generic AWS region
         # variables are present in the deployment environment.
