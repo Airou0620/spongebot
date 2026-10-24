@@ -77,6 +77,26 @@ class StorageTests(unittest.TestCase):
         self.client.stop()
         self.env.stop()
 
+    def test_cloudflare_r2_uses_auto_region_and_path_style(self):
+        # R2 must use the "auto" signing region even if generic AWS region
+        # variables are present in the deployment environment.
+        r2_env = {
+            **ENV,
+            "ENDPOINT": "https://account-id.r2.cloudflarestorage.com",
+            "REGION": "eu-west-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+        }
+        fake = FakeS3()
+        with patch.dict("os.environ", r2_env, clear=True):
+            with patch("storage.boto3.client", return_value=fake) as factory:
+                storage = MemeStorage()
+                try:
+                    kwargs = factory.call_args.kwargs
+                    self.assertEqual(kwargs["region_name"], "auto")
+                    self.assertEqual(kwargs["config"].s3["addressing_style"], "path")
+                finally:
+                    storage.close()
+
     def test_startup_warms_all_catalogs_once(self):
         self.assertEqual([c["Prefix"] for c in self.s3.calls], ["memes/", "memes/YN/", "airou/"])
         self.assertEqual(self.storage.list_memes(), ("S1海綿.jpg", "S2海綿.png", "S3香蕉.JPG"))
