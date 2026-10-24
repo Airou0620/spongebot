@@ -65,15 +65,24 @@ class MemeStorage:
             if self._is_r2_endpoint
             else (configured_region or "auto")
         )
-        # R2's documented S3 API endpoint is account-scoped. Use path-style
-        # addressing for R2; preserve the existing behavior for other providers.
-        # S3_ADDRESSING_STYLE can override the address style for other S3 systems.
-        addressing_style = os.getenv("S3_ADDRESSING_STYLE")
-        if not addressing_style:
-            addressing_style = "path" if self._is_r2_endpoint else "virtual"
+        # Railway Buckets publish the required URL style as AWS_S3_URL_STYLE.
+        # Older buckets can require path-style, so never ignore this provider setting.
+        # Keep S3_ADDRESSING_STYLE as an explicit app-level override.
+        app_addressing_style = (os.getenv("S3_ADDRESSING_STYLE") or "").strip()
+        railway_addressing_style = (os.getenv("AWS_S3_URL_STYLE") or "").strip()
+        addressing_style_source = (
+            "S3_ADDRESSING_STYLE"
+            if app_addressing_style
+            else ("AWS_S3_URL_STYLE" if railway_addressing_style else "provider_default")
+        )
+        addressing_style = (
+            app_addressing_style
+            or railway_addressing_style
+            or ("path" if self._is_r2_endpoint else "virtual")
+        )
         if addressing_style not in {"auto", "path", "virtual"}:
             raise RuntimeError(
-                "S3_ADDRESSING_STYLE must be one of: auto, path, virtual"
+                "S3_ADDRESSING_STYLE/AWS_S3_URL_STYLE must be one of: auto, path, virtual"
             )
         # Print only non-secret diagnostics. Never print key values or bucket contents.
         endpoint_source = "ENDPOINT" if (os.getenv("ENDPOINT") or "").strip() else "AWS_ENDPOINT_URL"
@@ -92,6 +101,9 @@ class MemeStorage:
             f"endpoint_source={endpoint_source} "
             f"r2_detected={self._is_r2_endpoint} "
             f"region={self.region!r} addressing_style={addressing_style!r} "
+            f"addressing_style_source={addressing_style_source} "
+            f"railway_url_style_present={bool(railway_addressing_style)} "
+            f"bucket_present={bool((os.getenv('BUCKET') or os.getenv('AWS_S3_BUCKET_NAME') or '').strip())} "
             f"access_key_source={access_source} secret_key_source={secret_source} "
             f"access_key_present={bool(self.access_key)} secret_key_present={bool(self.secret_key)} "
             f"access_key_has_outer_whitespace={raw_access != raw_access.strip()} "
