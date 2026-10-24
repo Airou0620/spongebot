@@ -28,9 +28,19 @@ jobs:
             -H "Project-Access-Token: $RAILWAY_TOKEN" \
             -H "Content-Type: application/json" \
             -H "User-Agent: Mozilla/5.0" \
-            --data '{"query":"query { projectToken { projectId environmentId } }"}')
+            --data '{"query":"query { projectToken { projectId environmentId } }"}' || true)
 
           echo "$TOKEN_INFO"
+
+          if echo "$TOKEN_INFO" | grep -q '"Project Token not found"'; then
+            echo "::warning::Skipping restart: Railway project token is invalid or no longer available."
+            exit 0
+          fi
+
+          if echo "$TOKEN_INFO" | grep -q 'error code: 1010'; then
+            echo "::warning::Skipping restart: blocked by Cloudflare (error code 1010)."
+            exit 0
+          fi
 
           export TOKEN_INFO
 
