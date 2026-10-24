@@ -6,6 +6,7 @@ import threading
 import tempfile
 from datetime import datetime
 from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
@@ -43,11 +44,29 @@ class MemeStorage:
         self.endpoint = _env("ENDPOINT", "AWS_ENDPOINT_URL")
         self.access_key = _env("ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
         self.secret_key = _env("SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
-        self.region = (
-            os.getenv("REGION")
-            or os.getenv("AWS_DEFAULT_REGION")
-            or "auto"
+        # Cloudflare R2 must be signed with region="auto". Do not let a
+        # generic AWS_DEFAULT_REGION override it; that causes SignatureDoesNotMatch.
+        endpoint_host = (urlsplit(self.endpoint).hostname or "").lower()
+        self._is_r2_endpoint = (
+            endpoint_host == "r2.cloudflarestorage.com"
+            or endpoint_host.endswith(".r2.cloudflarestorage.com")
         )
+        configured_region = os.getenv("REGION") or os.getenv("AWS_DEFAULT_REGION")
+        self.region = (
+            "auto"
+            if self._is_r2_endpoint
+            else (configured_region or "auto")
+        )
+        # R2's documented S3 API endpoint is account-scoped. Use path-style
+        # addressing for R2; preserve the existing behavior for other providers.
+        # S3_ADDRESSING_STYLE can override the address style for other S3 systems.
+        addressing_style = os.getenv("S3_ADDRESSING_STYLE")
+        if not addressing_style:
+            addressing_style = "path" if self._is_r2_endpoint else "virtual"
+        if addressing_style not in {"auto", "path", "virtual"}:
+            raise RuntimeError(
+                "S3_ADDRESSING_STYLE must be one of: auto, path, virtual"
+            )
         self.bucket = _env("BUCKET", "AWS_S3_BUCKET_NAME")
 
         self.meme_prefix = os.getenv("MEME_PREFIX", "memes").strip("/")
@@ -70,7 +89,7 @@ class MemeStorage:
             region_name=self.region,
             config=Config(
                 signature_version="s3v4",
-                s3={"addressing_style": "virtual"},
+                s3={"addressing_style": addressing_style},
                 retries={"max_attempts": 5, "mode": "standard"},
                 max_pool_connections=int(
                     os.getenv("S3_MAX_POOL_CONNECTIONS", "2")
