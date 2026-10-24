@@ -19,9 +19,13 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def _env(primary: str, fallback: str | None = None, default: str | None = None) -> str:
+    # Railway variables pasted from dashboards can accidentally include
+    # surrounding whitespace/newlines; these are never valid in S3 credentials.
     value = os.getenv(primary)
+    value = value.strip() if value is not None else None
     if not value and fallback:
         value = os.getenv(fallback)
+        value = value.strip() if value is not None else None
     if not value:
         value = default
     if value is None:
@@ -51,7 +55,11 @@ class MemeStorage:
             endpoint_host == "r2.cloudflarestorage.com"
             or endpoint_host.endswith(".r2.cloudflarestorage.com")
         )
-        configured_region = os.getenv("REGION") or os.getenv("AWS_DEFAULT_REGION")
+        configured_region = (
+            (os.getenv("REGION") or "").strip()
+            or (os.getenv("AWS_DEFAULT_REGION") or "").strip()
+            or None
+        )
         self.region = (
             "auto"
             if self._is_r2_endpoint
@@ -67,6 +75,31 @@ class MemeStorage:
             raise RuntimeError(
                 "S3_ADDRESSING_STYLE must be one of: auto, path, virtual"
             )
+        # Print only non-secret diagnostics. Never print key values or bucket contents.
+        endpoint_source = "ENDPOINT" if (os.getenv("ENDPOINT") or "").strip() else "AWS_ENDPOINT_URL"
+        access_source = "ACCESS_KEY_ID" if (os.getenv("ACCESS_KEY_ID") or "").strip() else "AWS_ACCESS_KEY_ID"
+        secret_source = "SECRET_ACCESS_KEY" if (os.getenv("SECRET_ACCESS_KEY") or "").strip() else "AWS_SECRET_ACCESS_KEY"
+        def _aliases_conflict(primary: str, fallback: str) -> bool:
+            left = (os.getenv(primary) or "").strip()
+            right = (os.getenv(fallback) or "").strip()
+            return bool(left and right and left != right)
+
+        raw_access = os.getenv(access_source) or ""
+        raw_secret = os.getenv(secret_source) or ""
+        print(
+            "[S3 config] "
+            f"endpoint_host={endpoint_host!r} "
+            f"endpoint_source={endpoint_source} "
+            f"r2_detected={self._is_r2_endpoint} "
+            f"region={self.region!r} addressing_style={addressing_style!r} "
+            f"access_key_source={access_source} secret_key_source={secret_source} "
+            f"access_key_present={bool(self.access_key)} secret_key_present={bool(self.secret_key)} "
+            f"access_key_has_outer_whitespace={raw_access != raw_access.strip()} "
+            f"secret_key_has_outer_whitespace={raw_secret != raw_secret.strip()} "
+            f"conflicting_endpoint_aliases={_aliases_conflict('ENDPOINT', 'AWS_ENDPOINT_URL')} "
+            f"conflicting_access_key_aliases={_aliases_conflict('ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID')} "
+            f"conflicting_secret_key_aliases={_aliases_conflict('SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY')}"
+        )
         self.bucket = _env("BUCKET", "AWS_S3_BUCKET_NAME")
 
         self.meme_prefix = os.getenv("MEME_PREFIX", "memes").strip("/")

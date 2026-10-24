@@ -77,6 +77,25 @@ class StorageTests(unittest.TestCase):
         self.client.stop()
         self.env.stop()
 
+    def test_environment_credentials_are_trimmed_without_logging_values(self):
+        env = {
+            **ENV,
+            "ENDPOINT": " https://storage.invalid ",
+            "ACCESS_KEY_ID": " key-with-padding\n",
+            "SECRET_ACCESS_KEY": " secret-with-padding ",
+        }
+        fake = FakeS3()
+        with patch.dict("os.environ", env, clear=True):
+            with patch("storage.boto3.client", return_value=fake) as factory:
+                storage = MemeStorage()
+                try:
+                    kwargs = factory.call_args.kwargs
+                    self.assertEqual(kwargs["endpoint_url"], "https://storage.invalid")
+                    self.assertEqual(kwargs["aws_access_key_id"], "key-with-padding")
+                    self.assertEqual(kwargs["aws_secret_access_key"], "secret-with-padding")
+                finally:
+                    storage.close()
+
     def test_cloudflare_r2_uses_auto_region_and_path_style(self):
         # R2 must use the "auto" signing region even if generic AWS region
         # variables are present in the deployment environment.
