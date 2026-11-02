@@ -13,7 +13,7 @@ from time import time
 import discord
 from discord import Intents, File
 from discord.ext import commands
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,6 +23,9 @@ from telegram.ext import (
 )
 
 from storage import MemeStorage
+from memory_utils import (
+    env_int, stream_telegram_photo, memory_reporter,
+)
 
 import sys
 import tempfile
@@ -149,6 +152,9 @@ intents.message_content = True
 discord_bot = commands.Bot(
     command_prefix="/",
     intents=intents,
+    # No edit/delete/reaction-history handlers use the message cache.
+    max_messages=None,
+    member_cache_flags=discord.MemberCacheFlags.none(),
 )
 
 
@@ -492,12 +498,11 @@ async def tg_reply_to_photo(
     )
     
     with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir) / received_filename
-    
-        # Telegram → disk，不建立整張 bytearray
-        await photo.download_to_drive(
-            custom_path=temp_path
-        )
+        # A display name may contain path separators; keep the local filename fixed.
+        temp_path = Path(temp_dir) / "received.jpg"
+
+        # PTB download_to_drive() can buffer the response; stream the HTTP body.
+        await stream_telegram_photo(photo, temp_path)
     
         # disk → Railway Bucket
         await asyncio.to_thread(
@@ -529,7 +534,7 @@ async def tg_reply_to_photo(
         )
 
         await update.message.reply_photo(
-            photo=photo_file,
+            photo=InputFile(photo_file, filename=random_file, read_file_handle=False),
             filename=random_file,
         )
 
@@ -564,7 +569,7 @@ async def tg_random_image(
         )
 
         await update.message.reply_photo(
-            photo=photo_file,
+            photo=InputFile(photo_file, filename=random_file, read_file_handle=False),
             filename=random_file,
         )
 
@@ -609,7 +614,7 @@ async def tg_can_i(
         )
 
         await update.message.reply_photo(
-            photo=photo_file,
+            photo=InputFile(photo_file, filename=file_name, read_file_handle=False),
             filename=file_name,
         )
 
@@ -726,7 +731,9 @@ async def tg_search_files(
                 )
 
                 await update.message.reply_photo(
-                    photo=photo_file,
+                    photo=InputFile(
+                        photo_file, filename=matching_files[0], read_file_handle=False,
+                    ),
                     filename=matching_files[0],
                 )
 
@@ -770,7 +777,15 @@ async def tg_search_files(
 
 
 def build_telegram_app():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(False)
+        .update_queue(asyncio.Queue(maxsize=env_int("TG_UPDATE_QUEUE_SIZE", 64, minimum=1)))
+        .connection_pool_size(env_int("TG_CONNECTION_POOL_SIZE", 4, minimum=1))
+        .pool_timeout(30.0)
+        .build()
+    )
 
     app.add_handler(
         CommandHandler("start", tg_start)
@@ -870,6 +885,8 @@ async def main():
         stop_event.wait()
     )
 
+    memory_task = asyncio.create_task(memory_reporter(tg_app))
+
     try:
         done, _ = await asyncio.wait(
             {discord_task, stop_task},
@@ -883,6 +900,8 @@ async def main():
                 raise exc
 
     finally:
+        memory_task.cancel()
+        await asyncio.gather(memory_task, return_exceptions=True)
         stop_task.cancel()
 
         if not discord_bot.is_closed():

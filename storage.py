@@ -4,24 +4,23 @@ import os
 import shutil
 import threading
 import tempfile
+from datetime import datetime
 from pathlib import PurePosixPath
-from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from catalog_index import CatalogSnapshot, FilenameIndex
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def _env(primary: str, fallback: str | None = None, default: str | None = None) -> str:
-    # Trim surrounding whitespace/newlines from Railway-provided credentials.
     value = os.getenv(primary)
-    value = value.strip() if value is not None else None
     if not value and fallback:
         value = os.getenv(fallback)
-        value = value.strip() if value is not None else None
     if not value:
         value = default
     if value is None:
@@ -30,70 +29,39 @@ def _env(primary: str, fallback: str | None = None, default: str | None = None) 
 
 
 class MemeStorage:
-    """
-    Railway S3-compatible Bucket storage.
+    """Railway S3 storage with a resident, immutable filename index.
 
-    預設 Bucket 結構：
-      memes/
-        *.jpg
-        YN/*.jpg
-
-      airou/
-        *.jpg
-      或舊資料夾名稱：
-      Airou/
-        *.jpg
-
-      PhotoReceived/
-        <user><num>.jpg
-
-      logs/
-        searchTG_output.log
-        searchDC_output.log
+    Construction warms memes/, memes/YN/ and airou/ (legacy Airou/ fallback)
+    before returning, so none of the three bot entrypoints serves a cold index.
+    Exactly one maintenance worker refreshes filenames every 900 seconds by
+    default. Reads never trigger a LIST request, even after an update failure.
+    Images remain in S3; only names are cached. Call close() when disposing of
+    a storage instance; normal process exit also stops scheduling refreshes.
     """
 
     def __init__(self):
         self.endpoint = _env("ENDPOINT", "AWS_ENDPOINT_URL")
         self.access_key = _env("ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
         self.secret_key = _env("SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
-
-        # Cloudflare R2 requires SigV4 region="auto".
-        endpoint_host = (urlsplit(self.endpoint).hostname or "").lower()
-        self._is_r2_endpoint = (
-            endpoint_host == "r2.cloudflarestorage.com"
-            or endpoint_host.endswith(".r2.cloudflarestorage.com")
-        )
-        configured_region = (
-            (os.getenv("REGION") or "").strip()
-            or (os.getenv("AWS_DEFAULT_REGION") or "").strip()
-            or None
-        )
         self.region = (
-            "auto"
-            if self._is_r2_endpoint
-            else (configured_region or "auto")
+            os.getenv("REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "auto"
         )
-
-        # Respect Railway Bucket URL style; app-level override wins.
-        app_addressing_style = (os.getenv("S3_ADDRESSING_STYLE") or "").strip()
-        railway_addressing_style = (os.getenv("AWS_S3_URL_STYLE") or "").strip()
-        addressing_style = (
-            app_addressing_style
-            or railway_addressing_style
-            or ("path" if self._is_r2_endpoint else "virtual")
-        )
-        if addressing_style not in {"auto", "path", "virtual"}:
-            raise RuntimeError(
-                "S3_ADDRESSING_STYLE/AWS_S3_URL_STYLE must be one of: auto, path, virtual"
-            )
-
         self.bucket = _env("BUCKET", "AWS_S3_BUCKET_NAME")
 
         self.meme_prefix = os.getenv("MEME_PREFIX", "memes").strip("/")
         self.airou_prefix = os.getenv("AIROU_PREFIX", "airou").strip("/")
         self.received_prefix = os.getenv("RECEIVED_PREFIX", "PhotoReceived").strip("/")
         self.log_prefix = os.getenv("LOG_PREFIX", "logs").strip("/")
-
+        self.log_rotate_bytes = max(
+            0, int(os.getenv("LOG_ROTATE_BYTES", "1048576"))
+        )
+        # S3_INDEX_TTL is deliberately not used: reads must never expire.
+        self._index = FilenameIndex(
+            self._load_catalog,
+            interval=float(os.getenv("S3_INDEX_REFRESH_SECONDS", "900")),
+        )
         self.s3 = boto3.client(
             "s3",
             endpoint_url=self.endpoint,
@@ -102,15 +70,21 @@ class MemeStorage:
             region_name=self.region,
             config=Config(
                 signature_version="s3v4",
-                s3={"addressing_style": addressing_style},
+                s3={"addressing_style": "virtual"},
                 retries={"max_attempts": 5, "mode": "standard"},
                 max_pool_connections=int(
                     os.getenv("S3_MAX_POOL_CONNECTIONS", "2")
                 ),
             ),
         )
-
         self._log_lock = threading.Lock()
+        try:
+            self.refresh()
+            self._index.start()
+        except BaseException:
+            self._index.close()
+            self.s3.close()
+            raise
 
     @staticmethod
     def _is_image(key: str) -> bool:
@@ -122,66 +96,63 @@ class MemeStorage:
             return f"{prefix}/{name}"
         return prefix or name
 
-    def _list_keys(self, prefix: str) -> list[str]:
+    def _scan_names(self, prefix: str) -> tuple[str, ...]:
+        """Refresh-only listing, one page at a time; never recurse into children."""
         prefix = prefix.strip("/")
         query = f"{prefix}/" if prefix else ""
-
-        result: list[str] = []
+        names = []
         paginator = self.s3.get_paginator("list_objects_v2")
-
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=query):
+        for page in paginator.paginate(
+            Bucket=self.bucket, Prefix=query, Delimiter="/",
+        ):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if self._is_image(key):
-                    result.append(key)
+                if not key.startswith(query):
+                    continue
+                name = key[len(query):]
+                if name and "/" not in name and self._is_image(name):
+                    names.append(name)
+        names.sort()
+        return tuple(names)
 
-        return result
+    def _load_catalog(self) -> CatalogSnapshot:
+        memes = self._scan_names(self.meme_prefix)
+        yn = self._scan_names(self._join(self.meme_prefix, "YN"))
+        airou = self._scan_names(self.airou_prefix)
+        if not airou and self.airou_prefix != "Airou":
+            airou = self._scan_names("Airou")
+        return CatalogSnapshot(memes=memes, yn=yn, airou=airou)
 
-    def list_memes(self) -> list[str]:
-        """等價於原本 os.listdir(dir_path) 後取頂層圖片。"""
-        root = f"{self.meme_prefix}/"
-        result = []
+    def refresh(self) -> dict[str, int]:
+        """Explicit startup/admin refresh, compatible with the standalone bots."""
+        snapshot = self._index.refresh()
+        return {
+            "memes": len(snapshot.memes),
+            "yn": len(snapshot.yn),
+            "airou": len(snapshot.airou),
+        }
 
-        for key in self._list_keys(self.meme_prefix):
-            rel = key[len(root):] if key.startswith(root) else key
-            if rel and "/" not in rel:
-                result.append(rel)
-
-        return sorted(result)
+    def list_memes(self) -> tuple[str, ...]:
+        """Return the same immutable tuple; O(1), no LIST, TTL, lock or list copy."""
+        return self._index.snapshot.memes
 
     def list_yn(self) -> list[str]:
-        """等價於原本 os.listdir(dir_path + "/YN")。"""
-        prefix = self._join(self.meme_prefix, "YN")
-        root = f"{prefix}/"
-        result = []
+        """Only this small catalog is copied: legacy tg_can_i() calls remove()."""
+        return list(self._index.snapshot.yn)
 
-        for key in self._list_keys(prefix):
-            rel = key[len(root):] if key.startswith(root) else key
-            if rel and "/" not in rel:
-                result.append(rel)
+    def list_airou(self) -> tuple[str, ...]:
+        return self._index.snapshot.airou
 
-        return sorted(result)
+    def search_memes(self, keyword: str) -> list[str]:
+        """Standalone-bot compatibility; substring search over RAM, not S3."""
+        needle = keyword.lower()
+        return [name for name in self.list_memes() if needle in name.lower()]
 
-    def list_airou(self) -> list[str]:
-        """
-        等價於原本 os.listdir(.../Airou)。
-        先用目前 Railway 上傳慣例 airou/；若空，再相容 Airou/。
-        """
-        prefixes = [self.airou_prefix]
-        if self.airou_prefix != "Airou":
-            prefixes.append("Airou")
-
-        for prefix in prefixes:
-            root = f"{prefix}/"
-            result = []
-            for key in self._list_keys(prefix):
-                rel = key[len(root):] if key.startswith(root) else key
-                if rel and "/" not in rel:
-                    result.append(rel)
-            if result:
-                return sorted(result)
-
-        return []
+    def close(self) -> None:
+        if self._index.close():
+            self.s3.close()
+        # If a refresh is still inside an S3 timeout, keep its pool alive until
+        # the owner is disposed; close() never schedules another refresh.
 
     def _get_bytes(self, key: str) -> bytes:
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -316,6 +287,40 @@ class MemeStorage:
         with self._log_lock:
             with tempfile.TemporaryFile() as log_file:
                 try:
+                    if self.log_rotate_bytes:
+                        try:
+                            size = self.s3.head_object(
+                                Bucket=self.bucket, Key=key
+                            ).get("ContentLength", 0)
+                        except ClientError as e:
+                            code = e.response.get("Error", {}).get("Code", "")
+                            if code not in ("NoSuchKey", "404"):
+                                raise
+                            size = 0
+
+                        if size + len(new_line) > self.log_rotate_bytes:
+                            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+                            archive_key = self._join(
+                                self.log_prefix,
+                                f"archive/{filename}.{stamp}.log",
+                            )
+                            if size:
+                                self.s3.copy_object(
+                                    Bucket=self.bucket,
+                                    Key=archive_key,
+                                    CopySource={"Bucket": self.bucket, "Key": key},
+                                )
+                            log_file.write(new_line)
+                            log_file.flush()
+                            log_file.seek(0)
+                            self.s3.put_object(
+                                Bucket=self.bucket,
+                                Key=key,
+                                Body=log_file,
+                                ContentType="text/plain; charset=utf-8",
+                            )
+                            return key
+
                     self._download_to_file(key, log_file)
                 except ClientError as e:
                     code = e.response.get("Error", {}).get("Code", "")
